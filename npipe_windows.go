@@ -89,6 +89,7 @@ const (
 	// this not-an-error that occurs if a client connects to the pipe between
 	// the server's CreateNamedPipe and ConnectNamedPipe calls.
 	error_pipe_connected syscall.Errno = 0x217
+	error_pipe_listening syscall.Errno = 0x218
 	error_pipe_busy      syscall.Errno = 0xE7
 	error_sem_timeout    syscall.Errno = 0x79
 
@@ -261,15 +262,16 @@ func Listen(address string) (*PipeListener, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PipeListener{PipeAddr(address), handle, false}, nil
+	return &PipeListener{PipeAddr(address), handle, false, nil}, nil
 }
 
 // PipeListener is a named pipe listener. Clients should typically
 // use variables of type net.Listener instead of assuming named pipe.
 type PipeListener struct {
-	addr   PipeAddr
-	handle syscall.Handle
-	closed bool
+	addr     PipeAddr
+	handle   syscall.Handle
+	closed   bool
+	deadline *time.Time
 }
 
 // Accept implements the Accept method in the net.Listener interface; it
@@ -308,13 +310,19 @@ func (l *PipeListener) AcceptPipe() (*PipeConn, error) {
 		return nil, err
 	}
 	defer syscall.CloseHandle(overlapped.HEvent)
-	if err := connectNamedPipe(handle, overlapped); err != nil && err != error_pipe_connected {
-		if err == error_io_incomplete || err == syscall.ERROR_IO_PENDING {
-			_, err = waitForCompletion(handle, overlapped)
+	for {
+		if err := connectNamedPipe(handle, overlapped); err != nil && err != error_pipe_connected {
+			var timeout bool
+			if err == error_io_incomplete || err == syscall.ERROR_IO_PENDING || err == error_pipe_listening {
+				timeout, err = l.waitForConnection(err, handle, overlapped)
+			}
+			if timeout {
+				continue
+			} else if err != nil {
+				return nil, err
+			}
 		}
-		if err != nil {
-			return nil, err
-		}
+		break
 	}
 	return &PipeConn{handle: handle, addr: l.addr}, nil
 }
@@ -336,6 +344,43 @@ func (l *PipeListener) Close() error {
 
 // Addr returns the listener's network address, a PipeAddr.
 func (l *PipeListener) Addr() net.Addr { return l.addr }
+
+// SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
+func (l *PipeListener) SetDeadline(t time.Time) error {
+	l.deadline = &t
+	return nil
+}
+
+func (l *PipeListener) waitForConnection(err error, handle syscall.Handle, overlapped *syscall.Overlapped) (isTimeout bool, newErr error) {
+	newErr = err
+	if err == error_io_incomplete || err == syscall.ERROR_IO_PENDING || err == error_pipe_listening {
+		var timer <-chan time.Time
+		if l.deadline != nil {
+			if timeDiff := l.deadline.Sub(time.Now()); timeDiff > 0 {
+				timer = time.After(timeDiff)
+			}
+		}
+		done := make(chan error)
+		go func() {
+			_, newErr = waitForCompletion(handle, overlapped)
+			done <- err
+		}()
+		select {
+		case newErr = <-done:
+		case <-timer:
+			isTimeout = true
+			syscall.CancelIoEx(handle, overlapped)
+			newErr = timeout(l.addr.String())
+		}
+	}
+	// Windows will produce ERROR_BROKEN_PIPE upon closing
+	// a handle on the other end of a connection. Go RPC
+	// expects an io.EOF error in this case.
+	if newErr == syscall.ERROR_BROKEN_PIPE {
+		newErr = io.EOF
+	}
+	return
+}
 
 // PipeConn is the implementation of the net.Conn interface for named pipe connections.
 type PipeConn struct {
@@ -468,7 +513,7 @@ func createPipe(address string, first bool) (syscall.Handle, error) {
 	if err != nil {
 		return 0, err
 	}
-	mode := uint32(pipe_access_duplex | syscall.FILE_FLAG_OVERLAPPED)
+	mode := uint32(pipe_access_duplex | pipe_nowait | syscall.FILE_FLAG_OVERLAPPED)
 	if first {
 		mode |= file_flag_first_pipe_instance
 	}
